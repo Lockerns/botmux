@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -337,6 +337,34 @@ describe('worktreeSafetyStatus', () => {
     expect(status.dirtyFiles).toContain('secret.env');
     expect(status.dirtyFiles).toContain('cache/');
     expect(status.dirtyFiles).not.toContain('cache/a.txt');
+  });
+
+  it('fingerprints an ignored directory symlink without following its target', async () => {
+    const repo = makeUpstream('ignored-symlink-safety');
+    writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore dependencies');
+    const firstTarget = join(tempRoot, 'dependencies-v1');
+    const secondTarget = join(tempRoot, 'dependencies-v2');
+    mkdirSync(firstTarget);
+    mkdirSync(secondTarget);
+    const firstTargetFile = join(firstTarget, 'package.json');
+    writeFileSync(firstTargetFile, '{"version":1}\n');
+    writeFileSync(join(secondTarget, 'package.json'), '{"version":2}\n');
+    const link = join(repo, 'node_modules');
+    symlinkSync(firstTarget, link, 'dir');
+
+    const first = await worktreeSafetyStatus(repo);
+    writeFileSync(firstTargetFile, '{"version":3}\n');
+    const targetContentChanged = await worktreeSafetyStatus(repo);
+    unlinkSync(link);
+    symlinkSync(secondTarget, link, 'dir');
+    const retargeted = await worktreeSafetyStatus(repo);
+
+    expect(first.dirtyFiles).toContain('node_modules');
+    expect(first.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(targetContentChanged.fingerprint).toBe(first.fingerprint);
+    expect(retargeted.fingerprint).not.toBe(first.fingerprint);
   });
 
   it('detects untracked files even when git config hides them', async () => {

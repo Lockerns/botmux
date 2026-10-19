@@ -10,7 +10,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { existsSync, lstatSync, mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readlinkSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { logger } from '../utils/logger.js';
@@ -436,6 +436,35 @@ async function safetyStatusEntries(dir: string): Promise<SafetyStatusEntry[]> {
   return entries;
 }
 
+async function safetyContentDigest(absolute: string, repoDir: string): Promise<string> {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // A tracked deletion is expected dirty state, not a scan failure.
+      return '<missing>';
+    }
+    throw error;
+  }
+  if (stat.isSymbolicLink()) {
+    // Hash the link itself. Dereferencing a directory link makes
+    // `git hash-object` fail and would let shared target contents affect the
+    // confirmation snapshot even though they are outside this worktree.
+    return createHash('sha256')
+      .update('symlink\0')
+      .update(readlinkSync(absolute))
+      .digest('hex');
+  }
+  if (stat.isDirectory()) {
+    const nested = await gitRaw([
+      'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
+    ], absolute, 10_000);
+    return createHash('sha256').update(nested).digest('hex');
+  }
+  return git(['hash-object', '--no-filters', absolute], repoDir, 10_000);
+}
+
 export async function worktreeSafetyStatus(worktreePath: string): Promise<WorktreeSafetyStatus> {
   const dir = resolve(worktreePath);
   const statusEntries = await safetyStatusEntries(dir);
@@ -468,9 +497,9 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
   }
   // `git status` records paths and states, not bytes. Hash the current worktree
   // content for every dirty entry so an already-dirty file changing between the
-  // confirmation card and deletion invalidates the confirmation. `git hash-object`
-  // handles regular files, symlinks and paths inside initialized submodules; a
-  // directory marker is expanded with the traditional ignored view so ignored
+  // confirmation card and deletion invalidates the confirmation. Regular files
+  // use `git hash-object`; symlinks hash their link text without dereferencing;
+  // a directory marker is expanded with the traditional ignored view so ignored
   // directory contents participate without changing the compact display list.
   const contentRows: string[] = [];
   for (const entry of statusEntries) {
@@ -483,27 +512,16 @@ export async function worktreeSafetyStatus(worktreePath: string): Promise<Worktr
       ], entry.repoDir, 10_000);
       for (const nestedEntry of parsePorcelainZ(nestedRaw, entry.repoDir)) {
         if (!nestedEntry.localPath.startsWith(localPath)) continue;
-        const digest = await git(['hash-object', '--no-filters', join(entry.repoDir, nestedEntry.localPath)], entry.repoDir, 10_000);
+        const digest = await safetyContentDigest(
+          join(entry.repoDir, nestedEntry.localPath.replace(/\/$/, '')),
+          entry.repoDir,
+        );
         const displayPath = path.slice(0, path.length - localPath.length) + nestedEntry.localPath;
         contentRows.push(`${displayPath}\0${digest}`);
       }
       continue;
     }
-    let digest: string;
-    if (!existsSync(absolute)) {
-      // A tracked deletion is expected dirty state, not a scan failure.
-      digest = '<missing>';
-    } else {
-      const stat = lstatSync(absolute);
-      if (stat.isDirectory()) {
-        const nested = await gitRaw([
-          'status', '--porcelain=v1', '-z', '--ignored=traditional', '--untracked-files=all',
-        ], absolute, 10_000);
-        digest = createHash('sha256').update(nested).digest('hex');
-      } else {
-        digest = await git(['hash-object', '--no-filters', absolute], entry.repoDir, 10_000);
-      }
-    }
+    const digest = await safetyContentDigest(absolute, entry.repoDir);
     contentRows.push(`${path}\0${digest}`);
   }
   // `write-tree` rejects unresolved conflicts. `ls-files --stage` serializes
