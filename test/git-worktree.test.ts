@@ -337,6 +337,32 @@ describe('worktreeSafetyStatus', () => {
     expect(status.dirtyFiles).toContain('secret.env');
     expect(status.dirtyFiles).toContain('cache/');
     expect(status.dirtyFiles).not.toContain('cache/a.txt');
+    expect(status.uncommittedCount).toBe(0);
+    expect(status.uncommittedFiles).toEqual([]);
+    expect(status.ignoredCount).toBe(2);
+    expect(status.ignoredFiles).toEqual(expect.arrayContaining(['secret.env', 'cache/']));
+  });
+
+  it('fingerprints ignored directories whose expanded status exceeds the child-process buffer', async () => {
+    const repo = makeUpstream('large-ignored-status');
+    writeFileSync(join(repo, '.gitignore'), 'cache/\n');
+    git(repo, 'add', '.gitignore');
+    git(repo, 'commit', '-m', 'ignore generated cache');
+    const component = 'd'.repeat(120);
+    const cache = join(repo, 'cache', component, component, component);
+    mkdirSync(cache, { recursive: true });
+    for (let i = 0; i < 2_500; i++) {
+      const name = `entry-${String(i).padStart(4, '0')}-${'x'.repeat(100)}`;
+      writeFileSync(join(cache, name), '');
+    }
+
+    const status = await worktreeSafetyStatus(repo);
+
+    expect(status.dirty).toBe(true);
+    expect(status.uncommittedCount).toBe(0);
+    expect(status.ignoredCount).toBe(1);
+    expect(status.ignoredFiles).toEqual(['cache/']);
+    expect(status.fingerprint).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it('fingerprints an ignored directory symlink without following its target', async () => {
@@ -362,6 +388,8 @@ describe('worktreeSafetyStatus', () => {
     const retargeted = await worktreeSafetyStatus(repo);
 
     expect(first.dirtyFiles).toContain('node_modules');
+    expect(first.uncommittedFiles).toEqual([]);
+    expect(first.ignoredFiles).toContain('node_modules');
     expect(first.fingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(targetContentChanged.fingerprint).toBe(first.fingerprint);
     expect(retargeted.fingerprint).not.toBe(first.fingerprint);
@@ -375,6 +403,8 @@ describe('worktreeSafetyStatus', () => {
     const status = await worktreeSafetyStatus(repo);
 
     expect(status.dirtyFiles).toContain('new.txt');
+    expect(status.uncommittedFiles).toContain('new.txt');
+    expect(status.ignoredFiles).toEqual([]);
   });
 
   it('reports the full dirty count while bounding file examples', async () => {
